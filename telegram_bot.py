@@ -22,7 +22,7 @@ else:
     print(f"⚠️  .env file not found at {env_file}")
     print("   Create a .env file by copying .env.example")
 
-BOT_TOKEN: Final[str | None] = os.getenv("8632424423:AAE_5R0J13ZkDqi9AUCMtMWJDFEl5vOB7-Q")
+BOT_TOKEN: Final[str | None] = os.getenv("TELEGRAM_BOT_TOKEN")
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
