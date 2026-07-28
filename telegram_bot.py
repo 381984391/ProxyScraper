@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from telegram import InputFile, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
-from proxy_scraper import scrape_proxies
+from proxy_scraper import filter_live_proxies, scrape_proxies
 
 # Load environment variables from .env file
 env_file = Path(__file__).parent / ".env"
@@ -87,12 +87,33 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle callback queries for export file selection."""
+    """Handle callback queries for export file selection and cleanup options."""
     query = update.callback_query
     if query is None:
         return
 
     await query.answer()
+    selection = query.data
+
+    if selection in {"export_all", "export_socks", "export_http"}:
+        context.user_data["export_selection"] = selection
+        keyboard = [
+            [InlineKeyboardButton("Yes, remove dead proxies", callback_data="clean_yes")],
+            [InlineKeyboardButton("No, export all proxies", callback_data="clean_no")],
+        ]
+        await query.edit_message_text(
+            "Do you want to remove dead proxies before exporting?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    export_selection = context.user_data.get("export_selection")
+    if export_selection is None:
+        await query.edit_message_text(
+            "❌ Export selection lost. Please use /export again."
+        )
+        return
+
     await query.edit_message_text("⏳ Preparing the selected proxy file, please wait...")
 
     try:
@@ -105,16 +126,15 @@ async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.message.reply_text("❌ Could not retrieve proxies for export at this time.")
             return
 
-        selection = query.data
-        if selection == "export_all":
+        if export_selection == "export_all":
             proxy_list = all_proxies
             filename = "all_proxies.txt"
             caption = "ALL proxies"
-        elif selection == "export_socks":
+        elif export_selection == "export_socks":
             proxy_list = socks_proxies
             filename = "socks4_socks5.txt"
             caption = "SOCKS4/SOCKS5 proxies"
-        elif selection == "export_http":
+        elif export_selection == "export_http":
             proxy_list = http_proxies
             filename = "http_https.txt"
             caption = "HTTP/HTTPS proxies"
@@ -122,8 +142,17 @@ async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.message.reply_text("❌ Unknown export option.")
             return
 
+        if selection == "clean_yes":
+            await query.message.reply_text(
+                "⏳ Checking live proxies. This may take up to a minute..."
+            )
+            proxy_list = await filter_live_proxies(proxy_list)
+            caption += " (live only)"
+
         if not proxy_list:
-            await query.message.reply_text(f"❌ No proxies found for {caption}.")
+            await query.message.reply_text(
+                f"❌ No proxies are available after the selected cleanup step for {caption}."
+            )
             return
 
         data_stream = BytesIO("\n".join(proxy_list).encode("utf-8"))
@@ -151,6 +180,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• `/proxies` - Fetch and preview proxies\n"
         "• `/export` - Download SOCKS, HTTP, and ALL proxies as .txt files\n"
         "• `/help` - Show this help text\n\n"
+        "**Export tip:**\n"
+        "• After choosing ALL / SOCKS4/SOCKS5 / HTTP/HTTPS, you can remove dead proxies before export\n"
+        "\n"
         "**Info:**\n"
         "• Expected proxies: ~7000-11000 (estimated)\n"
         "• Working rate: 2-5% (expected)\n"
@@ -172,7 +204,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("proxies", proxies_command))
     application.add_handler(CommandHandler("export", export_command))
-    application.add_handler(CallbackQueryHandler(export_callback, pattern="^export_"))
+    application.add_handler(CallbackQueryHandler(export_callback, pattern="^(?:export|clean)_"))
     application.add_handler(CommandHandler("help", help_command))
 
     print("✅ Bot connected. Listening for messages...")
