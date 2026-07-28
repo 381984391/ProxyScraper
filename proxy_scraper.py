@@ -66,6 +66,44 @@ def _classify_source(name: str, url: str) -> str:
     return "http"
 
 
+async def _check_proxy_alive(proxy: str, timeout: int = 5) -> bool:
+    """Return True if the proxy host:port accepts a TCP connection."""
+    address = proxy.split("@")[-1] if "@" in proxy else proxy
+    try:
+        host, port_text = address.rsplit(":", 1)
+        port = int(port_text)
+    except ValueError:
+        return False
+
+    try:
+        conn = asyncio.open_connection(host, port)
+        reader, writer = await asyncio.wait_for(conn, timeout)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except AttributeError:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+async def filter_live_proxies(
+    proxies: list[str],
+    timeout: int = 5,
+    max_concurrent: int = 50,
+) -> list[str]:
+    """Filter proxy list by checking whether each host:port is alive."""
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def _check_one(proxy: str) -> str | None:
+        async with semaphore:
+            return proxy if await _check_proxy_alive(proxy, timeout) else None
+
+    results = await asyncio.gather(*[_check_one(proxy) for proxy in proxies])
+    return [proxy for proxy in results if proxy]
+
+
 async def scrape_proxies(
     printer: Callable[[str], None] | None = None,
     return_categories: bool = False,
