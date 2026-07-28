@@ -67,6 +67,7 @@ python telegram_bot.py
 Comandos disponíveis:
 - `/start` - Mostra boas-vindas e instruções
 - `/proxies` - Busca e envia proxies
+- `/export` - Escolhe tipo e filtra apenas proxies vivos ou todos
 - `/help` - Mostra ajuda detalhada
 
 ### Módulo Python

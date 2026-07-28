@@ -4,15 +4,16 @@
 import asyncio
 import os
 import sys
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 from dotenv import load_dotenv
 from telegram import InputFile, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
-from proxy_scraper import filter_live_proxies, scrape_proxies
+from proxy_scraper import check_proxies, scrape_proxies
 
 # Load environment variables from .env file
 env_file = Path(__file__).parent / ".env"
@@ -23,135 +24,185 @@ else:
     print("   Create a .env file by copying .env.example")
 
 BOT_TOKEN: Final[str | None] = os.getenv("TELEGRAM_BOT_TOKEN")
+RATE_LIMIT_SECONDS = 20
+MAX_PROXY_PREVIEW = 20
+
+
+def _can_execute(user_data: dict[str, Any], key: str, limit: int = RATE_LIMIT_SECONDS) -> tuple[bool, float]:
+    now = datetime.utcnow()
+    last_time = user_data.get(key)
+    if isinstance(last_time, datetime):
+        elapsed = (now - last_time).total_seconds()
+        if elapsed < limit:
+            return False, limit - elapsed
+    user_data[key] = now
+    return True, 0.0
+
+
+def _preview_text(proxies: list[str]) -> str:
+    preview = proxies[:MAX_PROXY_PREVIEW]
+    result = "\n".join(preview)
+    if len(proxies) > MAX_PROXY_PREVIEW:
+        result += f"\n\n... and {len(proxies) - MAX_PROXY_PREVIEW} more proxies."
+    return result
+
+
+def _build_main_keyboard() -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton("Export ALL", callback_data="export_type_all")],
+        [InlineKeyboardButton("Export HTTP", callback_data="export_type_http")],
+        [InlineKeyboardButton("Export SOCKS", callback_data="export_type_socks")],
+        [InlineKeyboardButton("Refresh proxies", callback_data="refresh_proxies")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _build_live_keyboard(selection: str) -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton("All proxies", callback_data=f"export_live_{selection}_all")],
+        [InlineKeyboardButton("Alive only", callback_data=f"export_live_{selection}_alive")],
+        [InlineKeyboardButton("Cancel", callback_data="cancel_action")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command."""
     await update.message.reply_text(
-        "🤖 **Proxy Scraper Bot**\n\n"
-        "Welcome! I'm a bot that fetches public proxies from multiple sources.\n\n"
-        "**Available commands:**\n"
-        "/start - Show this message\n"
-        "/proxies - Fetch and send proxies\n"
-        "/export - Export SOCKS, HTTP, and ALL proxies as .txt files\n"
-        "/help - Show detailed help",
+        "🤖 *Proxy Scraper Bot*\n\n"
+        "Fetch public proxies from multiple sources with a clean export flow.\n\n"
+        "*Commands:*\n"
+        "/proxies - Fetch and preview proxies\n"
+        "/export - Export proxy lists by type\n"
+        "/help - Show this help message",
         parse_mode="Markdown"
     )
 
 
 async def proxies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /proxies command - fetch and send proxies."""
-    await update.message.reply_text("⏳ Gathering proxies from multiple sources, please wait...")
+    """Handle /proxies command - fetch and preview proxies."""
+    allowed, wait = _can_execute(context.user_data, "last_proxies")
+    if not allowed:
+        await update.message.reply_text(
+            f"⏳ Please wait {int(wait)} seconds before requesting proxies again."
+        )
+        return
 
+    await update.message.reply_text("⏳ Fetching proxies from sources, please wait...")
     try:
-        proxies = await scrape_proxies()
-        if not proxies:
+        categories = await scrape_proxies(return_categories=True)
+        all_proxies = categories.get("all", [])
+        http_proxies = categories.get("http", [])
+        socks_proxies = categories.get("socks", [])
+
+        if not all_proxies:
             await update.message.reply_text("❌ Could not retrieve proxies at this time.")
             return
 
-        context.user_data["proxies_requested"] = True
-        total = len(proxies)
-        preview = proxies[:25]
+        context.user_data["proxy_cache"] = categories
 
-        message = f"✅ **{total} proxies found**\n\n"
-        message += "\n".join(preview)
-        
-        if total > 25:
-            message += f"\n\n... and {total - 25} more proxies."
-            message += "\n\n_To save all proxies, use /export_"
+        message = (
+            "✅ *Proxy list ready*\n\n"
+            f"• *ALL:* {len(all_proxies)}\n"
+            f"• *HTTP/HTTPS:* {len(http_proxies)}\n"
+            f"• *SOCKS4/SOCKS5:* {len(socks_proxies)}\n\n"
+            "*Preview:*\n"
+            f"{_preview_text(all_proxies)}\n\n"
+            "Use the buttons below to export or refresh the proxy list."
+        )
 
-        await update.message.reply_text(message, parse_mode="Markdown")
+        await update.message.reply_text(
+            message,
+            parse_mode="Markdown",
+            reply_markup=_build_main_keyboard(),
+        )
     except Exception as exc:
         await update.message.reply_text(f"❌ An error occurred: {exc}")
 
 
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /export command - ask the user which proxy file to download."""
-    if not context.user_data.get("proxies_requested"):
+    """Handle /export command - show export options."""
+    if not context.user_data.get("proxy_cache"):
         await update.message.reply_text(
-            "❌ Please use /proxies first to load proxies before exporting."
+            "Please use /proxies first to fetch a fresh proxy list, then export it from the buttons."
         )
         return
 
-    keyboard = [
-        [InlineKeyboardButton("ALL", callback_data="export_all")],
-        [InlineKeyboardButton("SOCKS4/SOCKS5", callback_data="export_socks")],
-        [InlineKeyboardButton("HTTP/HTTPS", callback_data="export_http")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
     await update.message.reply_text(
-        "Choose which proxy list you want to export:",
-        reply_markup=reply_markup,
+        "Choose the proxy type to export:",
+        reply_markup=_build_main_keyboard(),
     )
 
 
-async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle callback queries for export file selection and cleanup options."""
+async def export_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle export type selection buttons."""
     query = update.callback_query
     if query is None:
         return
 
     await query.answer()
-    selection = query.data
-
-    if selection in {"export_all", "export_socks", "export_http"}:
-        context.user_data["export_selection"] = selection
-        keyboard = [
-            [InlineKeyboardButton("Yes, remove dead proxies", callback_data="clean_yes")],
-            [InlineKeyboardButton("No, export all proxies", callback_data="clean_no")],
-        ]
-        await query.edit_message_text(
-            "Do you want to remove dead proxies before exporting?",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
+    selection = query.data.replace("export_type_", "")
+    if selection not in {"all", "http", "socks"}:
+        await query.message.reply_text("❌ Unknown proxy type.")
         return
 
-    export_selection = context.user_data.get("export_selection")
-    if export_selection is None:
-        await query.edit_message_text(
-            "❌ Export selection lost. Please use /export again."
-        )
+    await query.edit_message_text(
+        "Choose whether you want all proxies or only alive ones:",
+        reply_markup=_build_live_keyboard(selection),
+    )
+
+
+async def export_live_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle live export choice buttons."""
+    query = update.callback_query
+    if query is None:
         return
 
-    await query.edit_message_text("⏳ Preparing the selected proxy file, please wait...")
+    await query.answer()
+    parts = query.data.split("_")
+    if len(parts) != 4 or parts[0] != "export" or parts[1] != "live":
+        await query.message.reply_text("❌ Unknown option.")
+        return
+
+    selection = parts[2]
+    live_mode = parts[3]
+    await query.edit_message_text("⏳ Preparing your export file, please wait...")
 
     try:
-        categories = await scrape_proxies(return_categories=True)
-        http_proxies = categories.get("http", [])
-        socks_proxies = categories.get("socks", [])
-        all_proxies = categories.get("all", [])
-
-        if not all_proxies:
-            await query.message.reply_text("❌ Could not retrieve proxies for export at this time.")
-            return
-
-        if export_selection == "export_all":
-            proxy_list = all_proxies
+        if selection == "all":
+            categories = await scrape_proxies(return_categories=True, protocol="all")
+            proxy_list = categories.get("all", [])
             filename = "all_proxies.txt"
             caption = "ALL proxies"
-        elif export_selection == "export_socks":
-            proxy_list = socks_proxies
-            filename = "socks4_socks5.txt"
-            caption = "SOCKS4/SOCKS5 proxies"
-        elif export_selection == "export_http":
-            proxy_list = http_proxies
+        elif selection == "http":
+            categories = await scrape_proxies(return_categories=True, protocol="http")
+            proxy_list = categories.get("all", [])
             filename = "http_https.txt"
             caption = "HTTP/HTTPS proxies"
+        elif selection == "socks":
+            categories = await scrape_proxies(return_categories=True, protocol="socks")
+            proxy_list = categories.get("all", [])
+            filename = "socks4_socks5.txt"
+            caption = "SOCKS4/SOCKS5 proxies"
         else:
-            await query.message.reply_text("❌ Unknown export option.")
+            await query.message.reply_text("❌ Unknown proxy type.")
             return
 
-        if selection == "clean_yes":
+        if not proxy_list:
+            await query.message.reply_text(f"❌ No proxies found for {caption}.")
+            return
+
+        if live_mode == "alive":
             await query.message.reply_text(
-                "⏳ Checking live proxies. This may take up to a minute..."
+                "⏳ Checking live proxies quickly... this may take a few seconds."
             )
-            proxy_list = await filter_live_proxies(proxy_list)
-            caption += " (live only)"
+            proxy_list = await check_proxies(proxy_list, concurrency=120, timeout=3.0)
+            caption = f"{caption} (alive only)"
+            filename = filename.replace(".txt", "_alive.txt")
 
         if not proxy_list:
             await query.message.reply_text(
-                f"❌ No proxies are available after the selected cleanup step for {caption}."
+                "❌ No live proxies were found after verification."
             )
             return
 
@@ -167,27 +218,79 @@ async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.message.reply_text(f"❌ An error occurred during export: {exc}")
 
 
+async def refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle refresh proxy list button."""
+    query = update.callback_query
+    if query is None:
+        return
+
+    await query.answer()
+    allowed, wait = _can_execute(context.user_data, "last_proxies")
+    if not allowed:
+        await query.message.reply_text(
+            f"⏳ Please wait {int(wait)} seconds before refreshing again."
+        )
+        return
+
+    await query.edit_message_text("⏳ Refreshing proxies, please wait...")
+    try:
+        categories = await scrape_proxies(return_categories=True)
+        all_proxies = categories.get("all", [])
+        http_proxies = categories.get("http", [])
+        socks_proxies = categories.get("socks", [])
+
+        if not all_proxies:
+            await query.message.reply_text("❌ Could not refresh proxies at this time.")
+            return
+
+        context.user_data["proxy_cache"] = categories
+        message = (
+            "✅ *Proxy list refreshed*\n\n"
+            f"• *ALL:* {len(all_proxies)}\n"
+            f"• *HTTP/HTTPS:* {len(http_proxies)}\n"
+            f"• *SOCKS4/SOCKS5:* {len(socks_proxies)}\n\n"
+            "Use the buttons below to export or refresh again."
+        )
+
+        await query.edit_message_text(
+            message,
+            parse_mode="Markdown",
+            reply_markup=_build_main_keyboard(),
+        )
+    except Exception as exc:
+        await query.message.reply_text(f"❌ An error occurred: {exc}")
+
+
+async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle cancel button action."""
+    query = update.callback_query
+    if query is None:
+        return
+
+    await query.answer()
+    await query.edit_message_text(
+        "✅ Action canceled. Use /proxies to fetch a fresh list anytime."
+    )
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /help command."""
     await update.message.reply_text(
         "**📖 Proxy Scraper Bot Help**\n\n"
         "**How to use:**\n"
-        "1. Use `/proxies` to fetch public proxies\n"
-        "2. The bot queries multiple reliable sources\n"
-        "3. Proxies are deduplicated (no duplicates)\n\n"
+        "1. Use `/proxies` to fetch a fresh list of public proxies.\n"
+        "2. After fetching, use the buttons to export ALL, HTTP, or SOCKS proxies.\n"
+        "3. Choose whether to export all proxies or only live ones.\n\n"
         "**Commands:**\n"
         "• `/start` - Show welcome message\n"
         "• `/proxies` - Fetch and preview proxies\n"
-        "• `/export` - Download SOCKS, HTTP, and ALL proxies as .txt files\n"
+        "• `/export` - Show export options\n"
         "• `/help` - Show this help text\n\n"
-        "**Export tip:**\n"
-        "• After choosing ALL / SOCKS4/SOCKS5 / HTTP/HTTPS, you can remove dead proxies before export\n"
-        "\n"
-        "**Info:**\n"
-        "• Expected proxies: ~7000-11000 (estimated)\n"
-        "• Working rate: 2-5% (expected)\n"
-        "• Data is refreshed each request\n\n"
-        "**Note:** These are public free proxies.",
+        "**Notes:**\n"
+        "• The bot caches the last proxy fetch for faster export.\n"
+        "• Rate limiting prevents spam and repeated fetches.\n"
+        "• Live check is fast but may take a few seconds.\n"
+        "• Public free proxies often have a low working rate.",
         parse_mode="Markdown"
     )
 
@@ -200,12 +303,15 @@ def main() -> None:
 
     print("🚀 Starting bot...")
     application = Application.builder().token(BOT_TOKEN).build()
-    
+
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("proxies", proxies_command))
     application.add_handler(CommandHandler("export", export_command))
-    application.add_handler(CallbackQueryHandler(export_callback, pattern="^(?:export|clean)_"))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CallbackQueryHandler(export_type_callback, pattern="^export_type_"))
+    application.add_handler(CallbackQueryHandler(export_live_callback, pattern="^export_live_"))
+    application.add_handler(CallbackQueryHandler(refresh_callback, pattern="^refresh_proxies$"))
+    application.add_handler(CallbackQueryHandler(cancel_callback, pattern="^cancel_action$"))
 
     print("✅ Bot connected. Listening for messages...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)

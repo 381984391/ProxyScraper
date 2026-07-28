@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import socket
 from typing import Callable
 
 import aiohttp
@@ -66,58 +67,31 @@ def _classify_source(name: str, url: str) -> str:
     return "http"
 
 
-async def _check_proxy_alive(proxy: str, timeout: int = 5) -> bool:
-    """Return True if the proxy host:port accepts a TCP connection."""
-    address = proxy.split("@")[-1] if "@" in proxy else proxy
-    try:
-        host, port_text = address.rsplit(":", 1)
-        port = int(port_text)
-    except ValueError:
-        return False
-
-    try:
-        conn = asyncio.open_connection(host, port)
-        reader, writer = await asyncio.wait_for(conn, timeout)
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except AttributeError:
-            pass
-        return True
-    except Exception:
-        return False
-
-
-async def filter_live_proxies(
-    proxies: list[str],
-    timeout: int = 5,
-    max_concurrent: int = 50,
-) -> list[str]:
-    """Filter proxy list by checking whether each host:port is alive."""
-    semaphore = asyncio.Semaphore(max_concurrent)
-
-    async def _check_one(proxy: str) -> str | None:
-        async with semaphore:
-            return proxy if await _check_proxy_alive(proxy, timeout) else None
-
-    results = await asyncio.gather(*[_check_one(proxy) for proxy in proxies])
-    return [proxy for proxy in results if proxy]
-
-
 async def scrape_proxies(
     printer: Callable[[str], None] | None = None,
     return_categories: bool = False,
+    protocol: str = "all",
 ) -> list[str] | dict[str, list[str]]:
     """Fetch free proxies from sources, deduplicate, and optionally return categories.
 
     Args:
         printer: Optional custom printer function. Defaults to print().
         return_categories: If True, returns a dict with http, socks, and all lists.
+        protocol: Select sources by protocol: "all", "http", or "socks".
 
     Returns:
         List of unique proxy addresses, or a category dict when return_categories is True.
     """
-    _emit(f"Scraping {len(PROXY_SOURCES)} sources...", printer)
+    protocol = protocol.lower()
+    sources = PROXY_SOURCES
+    if protocol in {"http", "socks"}:
+        sources = [
+            (name, url)
+            for name, url in PROXY_SOURCES
+            if _classify_source(name, url) == protocol
+        ]
+
+    _emit(f"Scraping {len(sources)} sources for {protocol.upper()} proxies...", printer)
 
     async def _fetch_one(name: str, url: str) -> list[tuple[str, str]]:
         category = _classify_source(name, url)
@@ -142,7 +116,7 @@ async def scrape_proxies(
             _emit(f"  ✗ {name} {exc}", printer)
             return []
 
-    results = await asyncio.gather(*[_fetch_one(name, url) for name, url in PROXY_SOURCES])
+    results = await asyncio.gather(*[_fetch_one(name, url) for name, url in sources])
 
     seen: set[str] = set()
     http_seen: set[str] = set()
@@ -173,6 +147,49 @@ async def scrape_proxies(
     if return_categories:
         return {"http": http_proxies, "socks": socks_proxies, "all": all_proxies}
     return all_proxies
+
+
+async def check_proxies(
+    proxies: list[str],
+    printer: Callable[[str], None] | None = None,
+    concurrency: int = 200,
+    timeout: float = 4.0,
+) -> list[str]:
+    """Quickly test whether each proxy host:port accepts a TCP connection."""
+    _emit(f"Checking {len(proxies)} proxies for liveliness...", printer)
+
+    async def _probe(proxy: str) -> str | None:
+        netloc = proxy.split("@")[-1]
+        if ":" not in netloc:
+            return None
+
+        try:
+            host, port_text = netloc.rsplit(":", 1)
+            port = int(port_text)
+        except Exception:
+            return None
+
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout,
+            )
+            writer.close()
+            await writer.wait_closed()
+            return proxy
+        except Exception:
+            return None
+
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _bound_probe(proxy: str) -> str | None:
+        async with semaphore:
+            return await _probe(proxy)
+
+    results = await asyncio.gather(*[_bound_probe(proxy) for proxy in proxies])
+    alive = [proxy for proxy in results if proxy is not None]
+    _emit(f"{len(alive)} proxies are alive", printer)
+    return alive
 
 
 if __name__ == "__main__":
